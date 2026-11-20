@@ -14,6 +14,11 @@ func chown(name string, info os.FileInfo) error {
 		return err
 	}
 	f.Close()
+	return chownExisting(name, info)
+}
+
+// chownExisting sets the owner of an existing file without truncating it.
+func chownExisting(name string, info os.FileInfo) error {
 	stat := info.Sys().(*syscall.Stat_t)
 	return osChown(name, int(stat.Uid), int(stat.Gid))
 }

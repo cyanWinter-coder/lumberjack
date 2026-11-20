@@ -22,7 +22,7 @@
 package lumberjack
 
 import (
-	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -107,9 +107,27 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
+	// Sidecars declares auxiliary files that are rotated atomically together
+	// with the main log file, as one file group.  Each sidecar lives next to
+	// the log file under the name <Filename><suffix> (e.g. server.log.sum)
+	// and its backups share the main file's generation timestamp (e.g.
+	// server-2006-01-02T15-04-05.000.log.sum).
+	//
+	// Before every rotation the main file and all sidecars are synced and
+	// closed; sidecars are synced in the order they are listed here.  If any
+	// rename or compression during rotation fails, the whole group is
+	// restored to a consistent state.  Cleanup (MaxBackups/MaxAge) and
+	// compression always process all members of a generation together, so no
+	// orphaned sidecar files are left behind.
+	Sidecars []Sidecar `json:"sidecars" yaml:"sidecars"`
+
 	size int64
 	file *os.File
 	mu   sync.Mutex
+
+	sidecarFiles []*sidecarFile
+	recoverOnce  sync.Once
+	recoverErr   error
 
 	millCh    chan bool
 	startMill sync.Once
@@ -122,6 +140,9 @@ var (
 	// os_Stat exists so it can be mocked out by tests.
 	osStat = os.Stat
 
+	// osRename exists so it can be mocked out by tests.
+	osRename = os.Rename
+
 	// megabyte is the conversion factor between MaxSize and bytes.  It is a
 	// variable so tests can mock it out and not need to write megabytes of data
 	// to disk.
@@ -133,6 +154,20 @@ var (
 // current time, and a new log file is created using the original log file name.
 // If the length of the write is greater than MaxSize, an error is returned.
 func (l *Logger) Write(p []byte) (n int, err error) {
+	return l.WriteContext(context.Background(), p)
+}
+
+// WriteContext is like Write, but the given context is checked before the
+// write is accepted.  Cancellation only ever prevents new writes from being
+// accepted: once a write has been accepted it always runs to completion, so
+// closing the context never truncates bytes that were already accepted.
+// Concurrent writes are serialized; every accepted write is applied to the
+// main log file and all configured sidecars as one unit.
+func (l *Logger) WriteContext(ctx context.Context, p []byte) (n int, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -158,6 +193,12 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	n, err = l.file.Write(p)
 	l.size += int64(n)
 
+	if n > 0 {
+		if serr := l.updateSidecars(p[:n], l.size-int64(n)); serr != nil && err == nil {
+			err = serr
+		}
+	}
+
 	return n, err
 }
 
@@ -168,13 +209,33 @@ func (l *Logger) Close() error {
 	return l.close()
 }
 
-// close closes the file if it is open.
+// close closes the file group if it is open.  Every member is synced to
+// disk before it is closed: the main log file first, then the sidecars in
+// their configured sync order.  All members are closed even if syncing or
+// closing one of them fails; the first error is returned.
 func (l *Logger) close() error {
-	if l.file == nil {
-		return nil
+	var err error
+	if l.file != nil {
+		if serr := l.file.Sync(); serr != nil {
+			err = serr
+		}
+		if cerr := l.file.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		l.file = nil
 	}
-	err := l.file.Close()
-	l.file = nil
+	for _, sc := range l.sidecarFiles {
+		if sc.file == nil {
+			continue
+		}
+		if serr := sc.file.Sync(); serr != nil && err == nil {
+			err = serr
+		}
+		if cerr := sc.file.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		sc.file = nil
+	}
 	return err
 }
 
@@ -189,10 +250,13 @@ func (l *Logger) Rotate() error {
 	return l.rotate()
 }
 
-// rotate closes the current file, moves it aside with a timestamp in the name,
-// (if it exists), opens a new file with the original filename, and then runs
+// rotate closes the current file group, moves it aside as one generation,
+// opens a new group with the original filenames, and then runs
 // post-rotation processing and removal.
 func (l *Logger) rotate() error {
+	if err := l.ensureRecovered(); err != nil {
+		return err
+	}
 	if err := l.close(); err != nil {
 		return err
 	}
@@ -203,8 +267,9 @@ func (l *Logger) rotate() error {
 	return nil
 }
 
-// openNew opens a new log file for writing, moving any old log file out of the
-// way.  This methods assumes the file has already been closed.
+// openNew opens a new log file group for writing, moving any old group out
+// of the way as a single generation.  This method assumes the group has
+// already been closed.
 func (l *Logger) openNew() error {
 	err := os.MkdirAll(l.dir(), 0755)
 	if err != nil {
@@ -214,15 +279,20 @@ func (l *Logger) openNew() error {
 	name := l.filename()
 	mode := os.FileMode(0600)
 	info, err := osStat(name)
-	if err == nil {
+	exists := err == nil
+	if exists {
 		// Copy the mode off the old logfile.
 		mode = info.Mode()
-		// move the existing file
-		newname := backupName(name, l.LocalTime)
-		if err := os.Rename(name, newname); err != nil {
-			return fmt.Errorf("can't rename log file: %s", err)
-		}
+	}
 
+	// Move the whole group aside with one generation timestamp.  If any
+	// member can't be moved, the group is rolled back to its original
+	// names so the current generation stays consistent.
+	if err := l.renameGroupAside(l.generation()); err != nil {
+		return err
+	}
+
+	if exists {
 		// this is a no-op anywhere but linux
 		if err := chown(name, info); err != nil {
 			return err
@@ -238,30 +308,42 @@ func (l *Logger) openNew() error {
 	}
 	l.file = f
 	l.size = 0
+	if err := l.openSidecars(mode, true); err != nil {
+		l.close()
+		return err
+	}
 	return nil
 }
 
-// backupName creates a new filename from the given name, inserting a timestamp
-// between the filename and the extension, using the local time if requested
-// (otherwise UTC).
-func backupName(name string, local bool) string {
+// generation returns the timestamp identifying the generation being
+// started now, using local time if requested (otherwise UTC).
+func (l *Logger) generation() string {
+	t := currentTime()
+	if !l.LocalTime {
+		t = t.UTC()
+	}
+	return t.Format(backupTimeFormat)
+}
+
+// backupNameGen creates a backup filename from the given name, inserting
+// the generation timestamp between the filename and the extension.
+func backupNameGen(name, gen string) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
 	ext := filepath.Ext(filename)
 	prefix := filename[:len(filename)-len(ext)]
-	t := currentTime()
-	if !local {
-		t = t.UTC()
-	}
-
-	timestamp := t.Format(backupTimeFormat)
-	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, gen, ext))
 }
 
 // openExistingOrNew opens the logfile if it exists and if the current write
 // would not put it over MaxSize.  If there is no such file or the write would
-// put it over the MaxSize, a new file is created.
+// put it over the MaxSize, a new file is created.  Leftover state from an
+// interrupted previous run is recovered first, so a new generation never
+// appends to files that belong to an interrupted one.
 func (l *Logger) openExistingOrNew(writeLen int) error {
+	if err := l.ensureRecovered(); err != nil {
+		return err
+	}
 	l.mill()
 
 	filename := l.filename()
@@ -285,6 +367,10 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	}
 	l.file = file
 	l.size = info.Size()
+	if err := l.openSidecars(0644, false); err != nil {
+		l.close()
+		return err
+	}
 	return nil
 }
 
@@ -298,75 +384,58 @@ func (l *Logger) filename() string {
 }
 
 // millRunOnce performs compression and removal of stale log files.
-// Log files are compressed if enabled via configuration and old log
-// files are removed, keeping at most l.MaxBackups files, as long as
-// none of them are older than MaxAge.
+// Backup files are processed as generation groups: the main log and its
+// sidecars always share a generation timestamp, and every member of a
+// generation is kept, compressed, or removed together, so no orphaned
+// sidecar files are left behind.  Generations are compressed if enabled
+// via configuration and old generations are removed, keeping at most
+// l.MaxBackups of them, as long as none are older than MaxAge.
 func (l *Logger) millRunOnce() error {
 	if l.MaxBackups == 0 && l.MaxAge == 0 && !l.Compress {
 		return nil
 	}
 
-	files, err := l.oldLogFiles()
+	groups, err := l.logGroups()
 	if err != nil {
 		return err
 	}
 
-	var compress, remove []logInfo
+	var remove []*logGroup
 
-	if l.MaxBackups > 0 && l.MaxBackups < len(files) {
-		preserved := make(map[string]bool)
-		var remaining []logInfo
-		for _, f := range files {
-			// Only count the uncompressed log file or the
-			// compressed log file, not both.
-			fn := f.Name()
-			if strings.HasSuffix(fn, compressSuffix) {
-				fn = fn[:len(fn)-len(compressSuffix)]
-			}
-			preserved[fn] = true
-
-			if len(preserved) > l.MaxBackups {
-				remove = append(remove, f)
-			} else {
-				remaining = append(remaining, f)
-			}
-		}
-		files = remaining
+	if l.MaxBackups > 0 && l.MaxBackups < len(groups) {
+		remove = append(remove, groups[l.MaxBackups:]...)
+		groups = groups[:l.MaxBackups]
 	}
 	if l.MaxAge > 0 {
 		diff := time.Duration(int64(24*time.Hour) * int64(l.MaxAge))
 		cutoff := currentTime().Add(-1 * diff)
 
-		var remaining []logInfo
-		for _, f := range files {
-			if f.timestamp.Before(cutoff) {
-				remove = append(remove, f)
+		var remaining []*logGroup
+		for _, g := range groups {
+			if g.timestamp.Before(cutoff) {
+				remove = append(remove, g)
 			} else {
-				remaining = append(remaining, f)
+				remaining = append(remaining, g)
 			}
 		}
-		files = remaining
+		groups = remaining
+	}
+
+	for _, g := range remove {
+		for _, f := range g.files {
+			errRemove := os.Remove(filepath.Join(l.dir(), f.info.Name()))
+			if err == nil && errRemove != nil {
+				err = errRemove
+			}
+		}
 	}
 
 	if l.Compress {
-		for _, f := range files {
-			if !strings.HasSuffix(f.Name(), compressSuffix) {
-				compress = append(compress, f)
+		for _, g := range groups {
+			errCompress := l.compressGroup(g)
+			if err == nil && errCompress != nil {
+				err = errCompress
 			}
-		}
-	}
-
-	for _, f := range remove {
-		errRemove := os.Remove(filepath.Join(l.dir(), f.Name()))
-		if err == nil && errRemove != nil {
-			err = errRemove
-		}
-	}
-	for _, f := range compress {
-		fn := filepath.Join(l.dir(), f.Name())
-		errCompress := compressLogFile(fn, fn+compressSuffix)
-		if err == nil && errCompress != nil {
-			err = errCompress
 		}
 	}
 
@@ -461,61 +530,6 @@ func (l *Logger) prefixAndExt() (prefix, ext string) {
 	ext = filepath.Ext(filename)
 	prefix = filename[:len(filename)-len(ext)] + "-"
 	return prefix, ext
-}
-
-// compressLogFile compresses the given log file, removing the
-// uncompressed log file if successful.
-func compressLogFile(src, dst string) (err error) {
-	f, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("failed to open log file: %v", err)
-	}
-	defer f.Close()
-
-	fi, err := osStat(src)
-	if err != nil {
-		return fmt.Errorf("failed to stat log file: %v", err)
-	}
-
-	if err := chown(dst, fi); err != nil {
-		return fmt.Errorf("failed to chown compressed log file: %v", err)
-	}
-
-	// If this file already exists, we presume it was created by
-	// a previous attempt to compress the log file.
-	gzf, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
-	if err != nil {
-		return fmt.Errorf("failed to open compressed log file: %v", err)
-	}
-	defer gzf.Close()
-
-	gz := gzip.NewWriter(gzf)
-
-	defer func() {
-		if err != nil {
-			os.Remove(dst)
-			err = fmt.Errorf("failed to compress log file: %v", err)
-		}
-	}()
-
-	if _, err := io.Copy(gz, f); err != nil {
-		return err
-	}
-	if err := gz.Close(); err != nil {
-		return err
-	}
-	if err := gzf.Close(); err != nil {
-		return err
-	}
-
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Remove(src); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // logInfo is a convenience struct to return the filename and its embedded

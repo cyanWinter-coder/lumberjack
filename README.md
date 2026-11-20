@@ -110,6 +110,52 @@ time, which may differ from the last time that file was written to.
 
 If MaxBackups and MaxAge are both 0, no old log files will be deleted.
 
+### Sidecars and atomic file-group rotation
+A Logger may declare auxiliary *sidecar* files (for example a checksum and an
+index for an audit log) that are rotated atomically together with the main
+log file, as one file group:
+
+```go
+l := &lumberjack.Logger{
+    Filename: "/var/log/foo/server.log",
+    MaxSize:  500,
+    Sidecars: []lumberjack.Sidecar{
+        {Suffix: ".sum", Kind: lumberjack.SidecarChecksum},
+        {Suffix: ".idx", Kind: lumberjack.SidecarIndex},
+    },
+}
+```
+
+Each sidecar lives next to the log file under `<Filename><suffix>` and its
+backups share the main file's generation timestamp
+(`server-2006-01-02T15-04-05.000.log.sum`).  The sidecar kind selects what
+lumberjack maintains in the file: `SidecarChecksum` keeps the hex-encoded
+SHA-256 and byte size of the current generation's log content,
+`SidecarIndex` appends one `<offset> <length>` line per accepted write, and
+`SidecarOpaque` (the default) leaves the content to the application.
+
+Before every rotation the main file and all sidecars are synced and closed
+(sidecars in the order they are listed).  The group is then moved aside
+member by member through recognizable temporary names; if any rename or
+compression fails, the whole group is rolled back to a consistent state.
+Cleanup (MaxBackups/MaxAge) and compression always process all members of a
+generation together, so no orphaned sidecar files are left behind.
+
+On startup, leftovers of an interrupted run are recovered before the first
+write: an interrupted rotation is completed into a single generation when
+possible, uncompletable temporary files are quarantined with a `.quarantine`
+suffix, and new writes always start a fresh generation rather than appending
+to an interrupted one.
+
+### func (\*Logger) WriteContext
+``` go
+func (l *Logger) WriteContext(ctx context.Context, p []byte) (n int, err error)
+```
+WriteContext is like Write, but the given context is checked before the
+write is accepted.  Cancellation only ever prevents new writes from being
+accepted: once a write has been accepted it always runs to completion, so
+closing the context never truncates bytes that were already accepted.
+
 
 
 
